@@ -303,11 +303,18 @@ class MedicoverSession:
 
         log.debug("Parametry wyszukiwania: %s", params)
 
-        resp = self.session.get(
-            API_BASE + SEARCH_ENDPOINT,
-            params=params,
-            timeout=30,
-        )
+        for attempt in range(4):
+            resp = self.session.get(
+                API_BASE + SEARCH_ENDPOINT,
+                params=params,
+                timeout=30,
+            )
+            if resp.status_code == 429:
+                wait = 30 * (attempt + 1)  # 30s, 60s, 90s, 120s
+                log.warning("429 Too Many Requests — czekam %ds przed ponowną próbą…", wait)
+                time.sleep(wait)
+                continue
+            break
         resp.raise_for_status()
 
         items = resp.json().get("items", [])
@@ -815,7 +822,9 @@ def run_monitor(args):
     all_booking_slot_tokens: dict = {}   # token -> slot
     slots_by_email: dict = {}            # email_to -> {token -> slot}
 
-    for watch in watches:
+    for i, watch in enumerate(watches):
+        if i > 0:
+            time.sleep(3)  # pauza między czujkami — unikamy 429
         days = int(watch.get("days_ahead", 30))
         end_date = (date.today() + timedelta(days=days)).isoformat()
         watch_name = watch.get("name", "")
