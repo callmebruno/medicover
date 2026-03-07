@@ -811,8 +811,9 @@ def run_monitor(args):
     notified = _load_notified()
     new_notified: set = set()
 
-    # Collect slots from all booking_reply watches into one combined email
+    # Collect slots from all watches
     all_booking_slot_tokens: dict = {}   # token -> slot
+    slots_by_email: dict = {}            # email_to -> {token -> slot}
 
     for watch in watches:
         days = int(watch.get("days_ahead", 30))
@@ -843,19 +844,20 @@ def run_monitor(args):
 
         new_notified |= {_slot_key(a) for a in appts}
 
-        # Use watch-specific email_to if defined, otherwise fall back to global
-        watch_email_cfg = dict(email_cfg)
-        if watch.get("email_to"):
-            watch_email_cfg["email_to"] = watch["email_to"]
-
-        # All watches always get booking buttons — accumulate for one combined email
+        # Group slots by target email address
+        target_email = watch.get("email_to") or email_cfg["email_to"]
         slot_tokens = {str(uuid.uuid4())[:8].upper(): a for a in appts}
         all_booking_slot_tokens.update(slot_tokens)
+        slots_by_email.setdefault(target_email, {}).update(slot_tokens)
 
-    # Send one combined email for all booking_reply slots, then wait once
+    # Send separate email per recipient, then wait once for IMAP signal
+    for target_email, tokens in slots_by_email.items():
+        cfg_for_send = dict(email_cfg)
+        cfg_for_send["email_to"] = target_email
+        send_email(list(tokens.values()), cfg_for_send, slot_tokens=tokens)
+        log.info("Email wysłany do %s (%d terminów).", target_email, len(tokens))
+
     if all_booking_slot_tokens:
-        all_booking_appts = list(all_booking_slot_tokens.values())
-        send_email(all_booking_appts, email_cfg, slot_tokens=all_booking_slot_tokens)
         log.info("Czekam %ds na sygnał rezerwacji (tokeny: %s)…",
                  BOOKING_WAIT_S, list(all_booking_slot_tokens.keys()))
         chosen = wait_for_slot_signal(email_cfg, all_booking_slot_tokens)
