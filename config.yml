@@ -26,14 +26,6 @@ watches:
   booking_type: 1
   days_ahead: 30
   time_from: '17:00'
-- name: Internista – Kraków
-  region_id: 202
-  specialization_id: 9
-  clinic_id: 13038
-  doctor_id: -1
-  booking_type: 1
-  days_ahead: 30
-  time_from: '17:00'
 - name: Stomatolog - leczenie – Kraków
   region_id: 202
   specialization_id: 23504
