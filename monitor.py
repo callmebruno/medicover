@@ -173,6 +173,11 @@ class MedicoverSession:
         )
         next_url = resp.headers.get("Location")
         log.info("[Auth 1/5] Redirect to: %s", next_url)
+        if not next_url:
+            raise AuthError(
+                f"Brak przekierowania w kroku 1 (status {resp.status_code}). "
+                "Możliwe rate-limiting (429) — odczekaj kilka minut."
+            )
 
         # Step 2 — land on IS3 login page, extract CSRF token
         resp = self.session.get(next_url, allow_redirects=False, timeout=30)
@@ -201,6 +206,17 @@ class MedicoverSession:
         resp.raise_for_status()
         next_url = resp.headers.get("Location")
         log.info("[Auth 3/5] After credentials, redirect: %s", next_url)
+        if not next_url:
+            # No redirect — login failed; check response for error message
+            soup3 = BeautifulSoup(resp.content, "html.parser")
+            err_div = soup3.find("div", class_="validation-summary-errors") or soup3.find("div", class_="text-danger")
+            err_msg = err_div.get_text(strip=True) if err_div else ""
+            log.error("[Auth 3/5] Brak przekierowania po logowaniu. Status: %d. Błąd na stronie: %s",
+                      resp.status_code, err_msg or "(brak)")
+            raise AuthError(
+                f"Logowanie nieudane — serwer nie przekierował (status {resp.status_code}). "
+                f"{('Komunikat: ' + err_msg) if err_msg else 'Sprawdź login i hasło lub spróbuj później.'}"
+            )
 
         # Step 3.5 — skip MFA-gate if present
         if next_url and "MfaGate" in next_url:
