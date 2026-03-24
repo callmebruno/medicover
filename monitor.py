@@ -135,10 +135,11 @@ class MedicoverSession:
     # MFA — fetch OTP code from IMAP inbox
     # ------------------------------------------------------------------
 
-    def _fetch_mfa_code_from_imap(self, timeout_s: int = 120) -> "str | None":
+    def _fetch_mfa_code_from_imap(self, timeout_s: int = 120, known_ids: "set | None" = None) -> "str | None":
         """Poll IMAP for Medicover MFA verification code email.
 
         Looks for an email from medicover@medicover.pl with a 6-digit code.
+        known_ids: set of IMAP message IDs to skip (captured before code was triggered).
         Returns the code string or None if not found within timeout.
         """
         import imaplib
@@ -161,25 +162,30 @@ class MedicoverSession:
             with imaplib.IMAP4_SSL(imap_host, 993) as imap:
                 imap.login(imap_user, imap_pass)
                 imap.select("INBOX")
-                log.info("IMAP: czekam na kod MFA (timeout %ds) …", timeout_s)
+
+                # Use pre-captured known_ids if provided, otherwise snapshot now
+                if known_ids is None:
+                    status, msgs = imap.search(
+                        None, f'(FROM "medicover" SINCE "{today_str}")',
+                    )
+                    known_ids = set(msgs[0].split()) if status == "OK" and msgs[0] else set()
+                log.info("IMAP: czekam na NOWY kod MFA (timeout %ds, istniejących: %d) …",
+                         timeout_s, len(known_ids))
 
                 while time.time() < deadline:
                     imap.noop()
-                    # Search for recent Medicover emails
                     status, msgs = imap.search(
-                        None,
-                        f'(FROM "medicover" SINCE "{today_str}")',
+                        None, f'(FROM "medicover" SINCE "{today_str}")',
                     )
                     if status == "OK" and msgs[0]:
                         msg_ids = msgs[0].split()
-                        # Check most recent emails first
-                        for mid in reversed(msg_ids[-10:]):
+                        new_ids = [m for m in msg_ids if m not in known_ids]
+                        for mid in reversed(new_ids):
                             _, msg_data = imap.fetch(mid, "(RFC822)")
                             if not msg_data or not msg_data[0]:
                                 continue
                             raw = msg_data[0][1]
                             msg = email_lib.message_from_bytes(raw)
-                            # Extract body
                             body = ""
                             if msg.is_multipart():
                                 for part in msg.walk():
@@ -193,7 +199,6 @@ class MedicoverSession:
                                 if payload:
                                     body = payload.decode("utf-8", errors="replace")
 
-                            # Look for 6-digit code
                             match = re.search(r'\b(\d{6})\b', body)
                             if match and "weryfikacyjny" in body.lower():
                                 return match.group(1)
@@ -300,46 +305,109 @@ class MedicoverSession:
             soup = BeautifulSoup(resp.content, "html.parser")
 
             # Check if this is a code-entry page (OTP via email)
-            code_input = soup.find("input", {"name": "Input.Code"}) or \
-                         soup.find("input", {"name": "Input.VerificationCode"}) or \
-                         soup.find("input", {"id": lambda x: x and "code" in x.lower()}) if soup else None
+            has_mfa_code = soup.find("input", {"name": "Input.MfaCode"})
 
-            mfa_csrf = soup.find("input", {"name": "__RequestVerificationToken"})
-            ret_url = soup.find("input", {"name": "Input.ReturnUrl"})
-            return_url_val = ret_url.get("value") if ret_url \
-                             else f"/connect/authorize/callback{auth_params}"
-            csrf_val = mfa_csrf.get("value") if mfa_csrf else ""
-
-            if code_input:
+            if has_mfa_code:
                 # --- MFA code verification ---
-                code_field_name = code_input.get("name", "Input.Code")
-                log.info("[Auth 3.5/5] MFA wymaga kodu — pobieram z IMAP …")
+                # Snapshot IMAP state BEFORE triggering code send
+                import imaplib as _imaplib
+                _imap_host = os.environ.get("IMAP_HOST", os.environ.get("SMTP_HOST", ""))
+                _imap_user = os.environ.get("SMTP_USER", "")
+                _imap_pass = os.environ.get("SMTP_PASS", "")
+                _today = date.today().strftime("%d-%b-%Y")
+                _pre_ids = set()
+                try:
+                    with _imaplib.IMAP4_SSL(_imap_host, 993) as _im:
+                        _im.login(_imap_user, _imap_pass)
+                        _im.select("INBOX")
+                        _st, _ms = _im.search(None, f'(FROM "medicover" SINCE "{_today}")')
+                        if _st == "OK" and _ms[0]:
+                            _pre_ids = set(_ms[0].split())
+                    log.info("[Auth 3.5/5] IMAP snapshot: %d istniejących emaili", len(_pre_ids))
+                except Exception as _e:
+                    log.warning("[Auth 3.5/5] Nie udało się zrobić IMAP snapshot: %s", _e)
 
-                otp = self._fetch_mfa_code_from_imap()
-                if not otp:
-                    raise AuthError("Nie udało się pobrać kodu MFA z emaila w ciągu 120s.")
-
-                log.info("[Auth 3.5/5] Kod MFA: %s — wysyłam …", otp)
-
-                # Find the form action URL
+                # Step 1: trigger code sending (browser does this via JS on page load)
                 form = soup.find("form")
                 form_action = form.get("action", "") if form else ""
                 if form_action and not form_action.startswith("http"):
                     form_action = f"{LOGIN_URL}{form_action}"
                 if not form_action:
-                    form_action = mfa_url  # POST back to the same URL
+                    form_action = mfa_url
+                if "Operation=" not in form_action:
+                    form_action += "&Operation=SIGN_IN" if "?" in form_action else "?Operation=SIGN_IN"
 
-                mfa_data = {
-                    "__RequestVerificationToken": csrf_val,
-                    "Input.ReturnUrl": return_url_val,
-                    code_field_name: otp,
-                }
+                resend_data = {}
+                for inp in (form.find_all("input") if form else []):
+                    name = inp.get("name")
+                    if name:
+                        resend_data[name] = inp.get("value", "")
+                resend_data["Input.Button"] = "resend"
+                log.info("[Auth 3.5/5] Wysyłam żądanie kodu MFA (resend) …")
+                resend_resp = self.session.post(
+                    form_action, data=resend_data,
+                    allow_redirects=False, timeout=30,
+                )
+                log.info("[Auth 3.5/5] Resend response: status=%d", resend_resp.status_code)
+
+                # Re-parse the form after resend (new CSRF token, new MfaCodeId)
+                if resend_resp.status_code == 200:
+                    soup = BeautifulSoup(resend_resp.content, "html.parser")
+                    form = soup.find("form")
+
+                # Step 2: wait for code via IMAP
+                log.info("[Auth 3.5/5] MFA wymaga kodu — pobieram z IMAP …")
+                otp = self._fetch_mfa_code_from_imap(known_ids=_pre_ids)
+                if not otp:
+                    raise AuthError("Nie udało się pobrać kodu MFA z emaila w ciągu 120s.")
+
+                log.info("[Auth 3.5/5] Kod MFA: %s — wysyłam …", otp)
+
+                # Collect ALL hidden form fields (re-parsed after resend)
+                form_action_confirm = form.get("action", "") if form else ""
+                if form_action_confirm and not form_action_confirm.startswith("http"):
+                    form_action_confirm = f"{LOGIN_URL}{form_action_confirm}"
+                if not form_action_confirm:
+                    form_action_confirm = mfa_url
+                if "Operation=" not in form_action_confirm:
+                    form_action_confirm += "&Operation=SIGN_IN" if "?" in form_action_confirm else "?Operation=SIGN_IN"
+
+                mfa_data = {}
+                for inp in (form.find_all("input") if form else []):
+                    name = inp.get("name")
+                    if name:
+                        mfa_data[name] = inp.get("value", "")
+                # Fill in the code and submit button
+                mfa_data["Input.MfaCode"] = otp
+                mfa_data["Input.Button"] = "confirm"
+                mfa_data["Input.IsTrustedDevice"] = "True"
+                mfa_data["Input.DeviceName"] = "Chrome"
+
+                # Debug: log what we're sending
+                for k, v in mfa_data.items():
+                    log.info("[MFA POST] %s = %s", k, str(v)[:80] if k != "__RequestVerificationToken" else "***")
+                log.info("[MFA POST] -> %s", form_action_confirm)
+
                 resp = self.session.post(
-                    form_action, data=mfa_data,
+                    form_action_confirm, data=mfa_data,
                     allow_redirects=False, timeout=30,
                 )
                 next_url = resp.headers.get("Location")
-                log.info("[Auth 3.5/5] After MFA code submit, redirect: %s", next_url)
+                log.info("[Auth 3.5/5] After MFA code submit: status=%d redirect=%s",
+                         resp.status_code, next_url)
+                if not next_url and resp.status_code == 200:
+                    err_soup = BeautifulSoup(resp.content, "html.parser")
+                    # Search broadly for any error/validation messages
+                    for sel in ["span.text-danger", "div.validation-summary-errors",
+                                ".field-validation-error", "[data-valmsg-summary]",
+                                ".alert-danger", ".error-message"]:
+                        err_el = err_soup.select_one(sel)
+                        if err_el and err_el.get_text(strip=True):
+                            log.error("[Auth 3.5/5] MFA error (%s): %s", sel, err_el.get_text(strip=True))
+                    # Also check if MfaCode field has new MfaCodeId (form re-rendered = code rejected)
+                    new_code_id = err_soup.find("input", {"name": "Input.MfaCodeId"})
+                    if new_code_id:
+                        log.warning("[Auth 3.5/5] Formularz MFA odesłany ponownie — kod odrzucony lub wygasł.")
 
                 # Follow any intermediate redirects (e.g. MfaGate -> callback)
                 while next_url and "callback" not in next_url and next_url != "/":
@@ -350,9 +418,12 @@ class MedicoverSession:
             else:
                 # --- MFA enrollment skip (legacy) ---
                 log.info("[Auth 3.5/5] MFA gate — skipping enrollment prompt …")
+                mfa_csrf = soup.find("input", {"name": "__RequestVerificationToken"})
+                ret_url = soup.find("input", {"name": "Input.ReturnUrl"})
                 mfa_data = {
-                    "__RequestVerificationToken": csrf_val,
-                    "Input.ReturnUrl": return_url_val,
+                    "__RequestVerificationToken": mfa_csrf.get("value") if mfa_csrf else "",
+                    "Input.ReturnUrl": ret_url.get("value") if ret_url
+                                       else f"/connect/authorize/callback{auth_params}",
                 }
                 resp = self.session.post(
                     f"{LOGIN_URL}/Account/MfaGate?handler=SkipMfaGate",

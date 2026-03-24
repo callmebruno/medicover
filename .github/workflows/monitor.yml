@@ -1,8 +1,6 @@
 name: Medicover Monitor
 
 on:
-  # schedule:
-  #- cron: '*/5 * * * *'
   workflow_dispatch:
     # Umożliwia ręczne uruchomienie z poziomu zakładki Actions
 
