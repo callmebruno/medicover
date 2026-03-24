@@ -43,9 +43,10 @@ jobs:
           MEDICOVER_USER: ${{ secrets.MEDICOVER_USER }}
           MEDICOVER_PASS: ${{ secrets.MEDICOVER_PASS }}
 
-          # Dane SMTP — GitHub Secrets (nigdy nie commituj!)
+          # Dane SMTP/IMAP — GitHub Secrets (nigdy nie commituj!)
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_HOST: poczta.interia.pl
 
           # Pozostałe parametry (REGION_ID, SPECIALIZATION_ID, EMAIL_TO itp.)
           # są wczytywane automatycznie z pliku config.yml w repozytorium.
