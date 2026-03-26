@@ -112,6 +112,9 @@ class AuthError(Exception):
 # Medicover session
 # ---------------------------------------------------------------------------
 
+SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session.json")
+
+
 class MedicoverSession:
     """Handles authentication and API calls against online24.medicover.pl."""
 
@@ -120,6 +123,51 @@ class MedicoverSession:
         self.password = password
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
+
+    # ------------------------------------------------------------------
+    # Session persistence
+    # ------------------------------------------------------------------
+
+    def save_session(self) -> None:
+        """Save session cookies to disk for reuse between runs."""
+        cookies = {c.name: c.value for c in self.session.cookies}
+        data = {"cookies": cookies, "saved_at": time.time()}
+        with open(SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        log.info("Sesja zapisana do %s (%d cookies).", SESSION_FILE, len(cookies))
+
+    def load_session(self) -> bool:
+        """Load saved session cookies. Returns True if session is still valid."""
+        if not os.path.exists(SESSION_FILE):
+            return False
+        try:
+            with open(SESSION_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            age_h = (time.time() - data.get("saved_at", 0)) / 3600
+            if age_h > 4:
+                log.info("Zapisana sesja za stara (%.1fh) — pomijam.", age_h)
+                return False
+            for name, value in data.get("cookies", {}).items():
+                self.session.cookies.set(name, value)
+            log.info("Wczytano sesję z pliku (%.1fh temu, %d cookies).",
+                     age_h, len(data.get("cookies", {})))
+        except Exception as e:
+            log.warning("Nie udało się wczytać sesji: %s", e)
+            return False
+        # Verify session is still alive with a lightweight API call
+        try:
+            resp = self.session.get(
+                API_BASE + FILTERS_ENDPOINT,
+                params={"RegionIds": 1, "SlotSearchType": 0},
+                timeout=15,
+            )
+            if resp.ok:
+                log.info("Zapisana sesja aktywna — pomijam logowanie.")
+                return True
+            log.info("Zapisana sesja wygasła (HTTP %d) — loguję ponownie.", resp.status_code)
+        except Exception as e:
+            log.warning("Nie udało się zweryfikować sesji: %s", e)
+        return False
 
     # ------------------------------------------------------------------
     # PKCE helpers
@@ -209,6 +257,23 @@ class MedicoverSession:
             log.error("IMAP: błąd podczas pobierania kodu MFA: %s", e)
         return None
 
+    def _exchange_token(self, code: str, code_verifier: str, redirect_uri: str):
+        """Exchange authorization code for access_token (Step 5)."""
+        token_data = {
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+            "code": code,
+            "code_verifier": code_verifier,
+            "client_id": "web",
+        }
+        resp = self.session.post(f"{LOGIN_URL}/connect/token", data=token_data, timeout=30)
+        resp.raise_for_status()
+        tokens = resp.json()
+        access_token = tokens.get("access_token")
+        if not access_token:
+            raise AuthError(f"Brak access_token w odpowiedzi serwera: {tokens}")
+        self.session.headers["Authorization"] = f"Bearer {access_token}"
+
     # ------------------------------------------------------------------
     # Authentication  (OAuth2 Authorization Code + PKCE)
     # ------------------------------------------------------------------
@@ -257,6 +322,39 @@ class MedicoverSession:
                 f"Brak przekierowania w kroku 1 (status {resp.status_code}). "
                 "Możliwe rate-limiting (429) — odczekaj kilka minut."
             )
+
+        # Check if SSO session is still valid (redirect goes to callback, not login page)
+        if next_url and "code=" in next_url:
+            log.info("[Auth 1/5] SSO sesja ważna — pomijam logowanie i MFA.")
+            step4_url = next_url
+            # Jump directly to step 4 (extract auth code)
+            if step4_url.startswith("/"):
+                step4_url = f"{LOGIN_URL}{step4_url}"
+            elif step4_url.startswith("https://online24"):
+                # Already a full callback URL with code — parse it directly
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(step4_url)
+                qs = parse_qs(parsed.query)
+                auth_code = qs.get("code", [None])[0]
+                if auth_code:
+                    log.info("[Auth 5/5] Exchanging code for token …")
+                    self._exchange_token(auth_code, code_verifier, oidc_redirect)
+                    log.info("Logowanie zakończone sukcesem.")
+                    self.save_session()
+                    return
+            resp = self.session.get(step4_url, allow_redirects=False, timeout=30)
+            next_url = resp.headers.get("Location")
+            if next_url and "code=" in next_url:
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(next_url)
+                qs = parse_qs(parsed.query)
+                auth_code = qs.get("code", [None])[0]
+                if auth_code:
+                    log.info("[Auth 5/5] Exchanging code for token …")
+                    self._exchange_token(auth_code, code_verifier, oidc_redirect)
+                    log.info("Logowanie zakończone sukcesem.")
+                    self.save_session()
+                    return
 
         # Step 2 — land on IS3 login page, extract CSRF token
         resp = self.session.get(next_url, allow_redirects=False, timeout=30)
@@ -457,21 +555,7 @@ class MedicoverSession:
 
         # Step 5 — exchange code for access_token
         log.info("[Auth 5/5] Exchanging code for token …")
-        token_data = {
-            "grant_type": "authorization_code",
-            "redirect_uri": oidc_redirect,
-            "code": code,
-            "code_verifier": code_verifier,
-            "client_id": "web",
-        }
-        resp = self.session.post(f"{LOGIN_URL}/connect/token", data=token_data, timeout=30)
-        resp.raise_for_status()
-        tokens = resp.json()
-        access_token = tokens.get("access_token")
-        if not access_token:
-            raise AuthError(f"Brak access_token w odpowiedzi serwera: {tokens}")
-
-        self.session.headers["Authorization"] = f"Bearer {access_token}"
+        self._exchange_token(code, code_verifier, oidc_redirect)
         log.info("Logowanie zakończone sukcesem.")
 
     # ------------------------------------------------------------------
@@ -1031,16 +1115,19 @@ def _save_notified(new_keys: set) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def _git_push_notified() -> None:
-    """Commit and push notified.json back to the repo (only in GitHub Actions)."""
+def _git_push_state() -> None:
+    """Commit and push notified.json + session.json back to the repo (GitHub Actions only)."""
     import subprocess
     if not os.environ.get("GITHUB_ACTIONS"):
         return
     try:
-        subprocess.run(["git", "add", NOTIFIED_FILE], check=True)
+        files = [NOTIFIED_FILE]
+        if os.path.exists(SESSION_FILE):
+            files.append(SESSION_FILE)
+        subprocess.run(["git", "add"] + files, check=True)
         diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
         if diff.returncode == 0:
-            log.info("notified.json bez zmian — pomijam commit.")
+            log.info("Brak zmian w plikach stanu — pomijam commit.")
             return
         subprocess.run(
             ["git", "commit", "-m", "chore: update notified slots [skip ci]"],
@@ -1048,9 +1135,9 @@ def _git_push_notified() -> None:
         )
         subprocess.run(["git", "pull", "--rebase", "--autostash"], check=True)
         subprocess.run(["git", "push"], check=True)
-        log.info("notified.json wypchnięty do repozytorium.")
+        log.info("Pliki stanu wypchnięte do repozytorium.")
     except Exception as e:
-        log.warning("Nie udało się wypchnąć notified.json: %s", e)
+        log.warning("Nie udało się wypchnąć plików stanu: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,7 +1173,9 @@ def run_monitor(args):
         }]
 
     sess = MedicoverSession(username, password)
-    sess.log_in()
+    if not sess.load_session():
+        sess.log_in()
+        sess.save_session()
 
     notified = _load_notified()
     new_notified: set = set()
@@ -1159,7 +1248,7 @@ def run_monitor(args):
 
     if new_notified:
         _save_notified(new_notified)
-        _git_push_notified()
+    _git_push_state()  # always push session.json + notified.json
 
 
 # ---------------------------------------------------------------------------
