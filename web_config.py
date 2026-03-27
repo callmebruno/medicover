@@ -190,8 +190,8 @@ HTML = r"""
     <div class="field">
       <label>Typ wizyty</label>
       <div class="radio-group">
-        <label><input type="radio" name="booking" value="2" checked> Telefoniczna</label>
-        <label><input type="radio" name="booking" value="1"> Stacjonarna</label>
+        <label><input type="radio" name="booking" value="2" checked onchange="loadSpecializations()"> Telefoniczna</label>
+        <label><input type="radio" name="booking" value="1" onchange="loadSpecializations()"> Stacjonarna</label>
       </div>
     </div>
     <div class="field">
@@ -684,9 +684,11 @@ def _normalize_list(items: list) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import sys
     import webbrowser
     print("Medicover Monitor — Konfigurator")
     print("Otwórz w przeglądarce: http://localhost:5000")
     print("Zatrzymaj: Ctrl+C\n")
-    webbrowser.open("http://localhost:5000")
+    if "--no-browser" not in sys.argv:
+        webbrowser.open("http://localhost:5000")
     app.run(host="127.0.0.1", port=5000, debug=False)
