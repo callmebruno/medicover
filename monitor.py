@@ -439,23 +439,7 @@ class MedicoverSession:
                 if "Operation=" not in form_action:
                     form_action += "&Operation=SIGN_IN" if "?" in form_action else "?Operation=SIGN_IN"
 
-                resend_data = {}
-                for inp in (form.find_all("input") if form else []):
-                    name = inp.get("name")
-                    if name:
-                        resend_data[name] = inp.get("value", "")
-                resend_data["Input.Button"] = "resend"
-                log.info("[Auth 3.5/5] Wysyłam żądanie kodu MFA (resend) …")
-                resend_resp = self.session.post(
-                    form_action, data=resend_data,
-                    allow_redirects=False, timeout=30,
-                )
-                log.info("[Auth 3.5/5] Resend response: status=%d", resend_resp.status_code)
-
-                # Re-parse the form after resend (new CSRF token, new MfaCodeId)
-                if resend_resp.status_code == 200:
-                    soup = BeautifulSoup(resend_resp.content, "html.parser")
-                    form = soup.find("form")
+                # GET MFA page already triggers code sending — no resend needed
 
                 # Step 2: wait for code via IMAP
                 log.info("[Auth 3.5/5] MFA wymaga kodu — pobieram z IMAP …")
