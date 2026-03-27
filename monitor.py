@@ -421,16 +421,13 @@ class MedicoverSession:
                 _imap_host = os.environ.get("IMAP_HOST", os.environ.get("SMTP_HOST", ""))
                 _imap_user = os.environ.get("SMTP_USER", "")
                 _imap_pass = os.environ.get("SMTP_PASS", "")
-                _yesterday = (date.today() - timedelta(days=1)).strftime("%d-%b-%Y")
-                _pre_uids = set()
+                _pre_exists = 0
                 try:
                     with _imaplib.IMAP4_SSL(_imap_host, 993) as _im:
                         _im.login(_imap_user, _imap_pass)
-                        _im.select("INBOX")
-                        _st, _data = _im.uid("search", None, f'(FROM "medicover" SINCE "{_yesterday}")')
-                        if _st == "OK" and _data[0]:
-                            _pre_uids = set(_data[0].split())
-                    log.info("[Auth 3.5/5] IMAP snapshot: %d znanych UID", len(_pre_uids))
+                        _st, _data = _im.select("INBOX")
+                        _pre_exists = int(_data[0]) if _st == "OK" else 0
+                    log.info("[Auth 3.5/5] IMAP snapshot: EXISTS=%d", _pre_exists)
                 except Exception as _e:
                     log.warning("[Auth 3.5/5] Nie udało się zrobić IMAP snapshot: %s", _e)
 
@@ -448,7 +445,7 @@ class MedicoverSession:
 
                 # Step 2: wait for code via IMAP
                 log.info("[Auth 3.5/5] MFA wymaga kodu — pobieram z IMAP …")
-                otp = self._fetch_mfa_code_from_imap(known_uids=_pre_uids)
+                otp = self._fetch_mfa_code_from_imap(known_exists=_pre_exists)
                 if not otp:
                     raise AuthError("Nie udało się pobrać kodu MFA z emaila w ciągu 120s.")
 
