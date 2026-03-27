@@ -40,7 +40,7 @@ jobs:
         timeout-minutes: 250
         run: python monitor.py monitor
         env:
-          MONITOR_INTERVAL_S: "300"
+          MONITOR_INTERVAL_S: "180"
           MONITOR_DURATION_S: "14400"
           # Dane logowania Medicover — GitHub Secrets (nigdy nie commituj!)
           MEDICOVER_USER: ${{ secrets.MEDICOVER_USER }}
