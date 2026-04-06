@@ -129,12 +129,15 @@ class MedicoverSession:
     # ------------------------------------------------------------------
 
     def save_session(self) -> None:
-        """Save session cookies to disk for reuse between runs."""
+        """Save session cookies + refresh_token to disk for reuse between runs."""
         cookies = {c.name: c.value for c in self.session.cookies}
         data = {"cookies": cookies, "saved_at": time.time()}
+        if getattr(self, "_refresh_token", None):
+            data["refresh_token"] = self._refresh_token
         with open(SESSION_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f)
-        log.info("Sesja zapisana do %s (%d cookies).", SESSION_FILE, len(cookies))
+        log.info("Sesja zapisana do %s (%d cookies, refresh=%s).",
+                 SESSION_FILE, len(cookies), "tak" if data.get("refresh_token") else "nie")
 
     def load_session(self) -> bool:
         """Load saved session cookies. Returns True if session is still valid."""
@@ -144,13 +147,16 @@ class MedicoverSession:
             with open(SESSION_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             age_h = (time.time() - data.get("saved_at", 0)) / 3600
-            if age_h > 4:
+            if age_h > 24:
                 log.info("Zapisana sesja za stara (%.1fh) — pomijam.", age_h)
                 return False
             for name, value in data.get("cookies", {}).items():
                 self.session.cookies.set(name, value)
-            log.info("Wczytano sesję z pliku (%.1fh temu, %d cookies).",
-                     age_h, len(data.get("cookies", {})))
+            if data.get("refresh_token"):
+                self._refresh_token = data["refresh_token"]
+            log.info("Wczytano sesję z pliku (%.1fh temu, %d cookies, refresh=%s).",
+                     age_h, len(data.get("cookies", {})),
+                     "tak" if data.get("refresh_token") else "nie")
         except Exception as e:
             log.warning("Nie udało się wczytać sesji: %s", e)
             return False
@@ -164,7 +170,11 @@ class MedicoverSession:
             if resp.ok:
                 log.info("Zapisana sesja aktywna — pomijam logowanie.")
                 return True
-            log.info("Zapisana sesja wygasła (HTTP %d) — loguję ponownie.", resp.status_code)
+            # access_token expired — try refresh
+            if self.refresh_access_token():
+                self.save_session()
+                return True
+            log.info("Zapisana sesja wygasła (HTTP %d), refresh nie działa — loguję ponownie.", resp.status_code)
         except Exception as e:
             log.warning("Nie udało się zweryfikować sesji: %s", e)
         return False
@@ -266,7 +276,7 @@ class MedicoverSession:
         return None
 
     def _exchange_token(self, code: str, code_verifier: str, redirect_uri: str):
-        """Exchange authorization code for access_token (Step 5)."""
+        """Exchange authorization code for access_token + refresh_token (Step 5)."""
         token_data = {
             "grant_type": "authorization_code",
             "redirect_uri": redirect_uri,
@@ -281,6 +291,37 @@ class MedicoverSession:
         if not access_token:
             raise AuthError(f"Brak access_token w odpowiedzi serwera: {tokens}")
         self.session.headers["Authorization"] = f"Bearer {access_token}"
+        self._refresh_token = tokens.get("refresh_token")
+        if self._refresh_token:
+            log.info("Otrzymano refresh_token — sesja będzie odświeżana automatycznie.")
+
+    def refresh_access_token(self) -> bool:
+        """Use refresh_token to get a new access_token without MFA. Returns True on success."""
+        if not getattr(self, "_refresh_token", None):
+            return False
+        try:
+            resp = self.session.post(f"{LOGIN_URL}/connect/token", data={
+                "grant_type": "refresh_token",
+                "refresh_token": self._refresh_token,
+                "client_id": "web",
+            }, timeout=30)
+            if not resp.ok:
+                log.warning("Refresh token odrzucony (HTTP %d) — potrzebne ponowne logowanie.", resp.status_code)
+                self._refresh_token = None
+                return False
+            tokens = resp.json()
+            access_token = tokens.get("access_token")
+            if not access_token:
+                return False
+            self.session.headers["Authorization"] = f"Bearer {access_token}"
+            new_refresh = tokens.get("refresh_token")
+            if new_refresh:
+                self._refresh_token = new_refresh
+            log.info("Token odświeżony pomyślnie (bez MFA).")
+            return True
+        except Exception as e:
+            log.warning("Błąd odświeżania tokenu: %s", e)
+            return False
 
     # ------------------------------------------------------------------
     # Authentication  (OAuth2 Authorization Code + PKCE)
@@ -1175,18 +1216,27 @@ def run_monitor(args):
             log.info("=== Iteracja %d — czekam %d min ===", loop_i, loop_interval // 60)
             time.sleep(loop_interval)
             # Re-check session validity
+            need_relogin = False
             try:
                 test = sess.session.get(API_BASE + SEARCH_ENDPOINT,
                                         params={"RegionIds": 202, "PageSize": 1},
                                         timeout=15)
                 if test.status_code == 401:
-                    log.info("Sesja wygasła — ponawiam logowanie…")
-                    sess.log_in()
-                    sess.save_session()
+                    need_relogin = True
             except Exception:
-                log.info("Błąd połączenia — ponawiam logowanie…")
-                sess.log_in()
-                sess.save_session()
+                need_relogin = True
+
+            if need_relogin:
+                if sess.refresh_access_token():
+                    sess.save_session()
+                else:
+                    log.info("Sesja wygasła, refresh_token nie działa — ponawiam logowanie…")
+                    try:
+                        sess.log_in()
+                        sess.save_session()
+                    except Exception as e:
+                        log.error("Re-login nieudany (%s) — kończę pętlę.", e)
+                        break
 
         log.info("=== Sprawdzanie terminów [iteracja %d] ===", loop_i)
         notified = _load_notified()
