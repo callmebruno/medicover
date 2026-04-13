@@ -2,10 +2,11 @@ EMAIL_TO: wtrela4@gmail.com
 SMTP_HOST: poczta.interia.pl
 SMTP_PORT: 465
 watches:
-- name: Endokrynolog doroĹ›li â€“ Kielce
-  region_id: 109674
-  specialization_id: 5
-  clinic_id: 71814
-  doctor_id: 220600
+- name: Stomatolog - leczenie – Kraków
+  region_id: 202
+  specialization_id: 23504
+  clinic_id: 59886
+  doctor_id: 333458
   booking_type: 1
   days_ahead: 30
+  email_to: p.iwonastolarz@gmail.com
