@@ -870,13 +870,54 @@ def api_git_push():
         if result.returncode != 0 and not nothing:
             raise RuntimeError(out.strip())
 
-        # Push to selected remote
-        push = subprocess.run(
-            ["git", "push", remote, "main"],
-            cwd=cwd, check=True, capture_output=True, text=True
+        # Sync with remote: rebase local commits on top of remote/main.
+        # Without this, push fails as non-fast-forward when GitHub Actions
+        # has auto-committed notified.json updates since the last push.
+        subprocess.run(["git", "fetch", remote, "main"],
+                       cwd=cwd, capture_output=True, text=True)
+        behind = subprocess.run(
+            ["git", "rev-list", "--count", f"HEAD..{remote}/main"],
+            cwd=cwd, capture_output=True, text=True
         )
-        push_out = push.stdout or push.stderr or f"Wypchnięto do {remote} pomyślnie."
-        return jsonify(ok=True, output=push_out)
+        if behind.returncode == 0 and int((behind.stdout or "0").strip() or "0") > 0:
+            rebase = subprocess.run(
+                ["git", "pull", "--rebase", remote, "main"],
+                cwd=cwd, capture_output=True, text=True
+            )
+            if rebase.returncode != 0:
+                subprocess.run(["git", "rebase", "--abort"],
+                               cwd=cwd, capture_output=True, text=True)
+                raise RuntimeError(
+                    f"Rebase failed on {remote}/main (conflict): "
+                    f"{(rebase.stderr or rebase.stdout).strip()}"
+                )
+
+        # Push to selected remote (retry once on race with concurrent push)
+        for attempt in range(2):
+            push = subprocess.run(
+                ["git", "push", remote, "main"],
+                cwd=cwd, capture_output=True, text=True
+            )
+            if push.returncode == 0:
+                push_out = push.stdout or push.stderr or f"Wypchnięto do {remote} pomyślnie."
+                return jsonify(ok=True, output=push_out)
+            # Race: remote moved between fetch and push — re-rebase and retry once
+            if attempt == 0 and "non-fast-forward" in (push.stderr or ""):
+                subprocess.run(["git", "fetch", remote, "main"],
+                               cwd=cwd, capture_output=True, text=True)
+                rebase = subprocess.run(
+                    ["git", "pull", "--rebase", remote, "main"],
+                    cwd=cwd, capture_output=True, text=True
+                )
+                if rebase.returncode != 0:
+                    subprocess.run(["git", "rebase", "--abort"],
+                                   cwd=cwd, capture_output=True, text=True)
+                    raise RuntimeError(
+                        f"Rebase failed on retry: "
+                        f"{(rebase.stderr or rebase.stdout).strip()}"
+                    )
+                continue
+            raise RuntimeError((push.stderr or push.stdout).strip())
     except subprocess.CalledProcessError as e:
         return jsonify(error=(e.stderr or e.stdout or str(e))), 500
     except Exception as e:
