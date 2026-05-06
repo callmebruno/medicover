@@ -2,6 +2,14 @@ EMAIL_TO: p.iwonastolarz@gmail.com
 SMTP_HOST: poczta.interia.pl
 SMTP_PORT: 465
 watches:
+- name: USG jamy brzusznej – Kraków
+  region_id: 202
+  specialization_id: 521
+  clinic_id: -1
+  doctor_id: -1
+  booking_type: 1
+  days_ahead: 30
+  time_to: '10:00'
 - name: Stomatolog - leczenie – Kraków
   region_id: 202
   specialization_id: 23504
@@ -9,4 +17,3 @@ watches:
   doctor_id: 333458
   booking_type: 1
   days_ahead: 30
-  email_to: p.iwonastolarz@gmail.com
