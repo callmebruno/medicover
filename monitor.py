@@ -1202,7 +1202,16 @@ def run_monitor(args):
 
     sess = MedicoverSession(username, password)
     if not sess.load_session():
-        sess.log_in()
+        login_attempts = 3
+        for attempt in range(1, login_attempts + 1):
+            try:
+                sess.log_in()
+                break
+            except AuthError as e:
+                log.error("Logowanie nieudane (próba %d/%d): %s", attempt, login_attempts, e)
+                if attempt == login_attempts:
+                    raise
+                time.sleep(15)
         sess.save_session()
 
     loop_interval = int(os.environ.get("MONITOR_INTERVAL_S", "300"))  # 5 min

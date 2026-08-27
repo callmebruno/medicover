@@ -39,10 +39,12 @@ jobs:
           echo "18.153.162.82 online24.medicover.pl" | sudo tee -a /etc/hosts
 
       - name: Odtwórz sesję z cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: session.json
-          key: medicover-session
+          key: medicover-session-${{ github.run_id }}
+          restore-keys: |
+            medicover-session-
 
       - name: Sprawdź terminy i wyślij email
         timeout-minutes: 250
@@ -61,3 +63,10 @@ jobs:
 
           # Pozostałe parametry (REGION_ID, SPECIALIZATION_ID, EMAIL_TO itp.)
           # są wczytywane automatycznie z pliku config.yml w repozytorium.
+
+      - name: Zapisz sesję do cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: session.json
+          key: medicover-session-${{ github.run_id }}
