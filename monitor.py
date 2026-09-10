@@ -17,6 +17,7 @@ Usage:
 Environment variables (required for monitoring):
     MEDICOVER_USER        Medicover identyfikator (cyfry, nie email)
     MEDICOVER_PASS        Medicover password
+    MEDICOVER_DEVICE_ID   Stały device_id (opcjonalnie; domyślnie zapisywany w session.json)
     REGION_ID             Region ID (e.g. 204 = Warsaw)
     SPECIALIZATION_ID     Specialization ID (e.g. 27962 = Endocrinology)
     CLINIC_ID             Clinic ID (-1 = any)
@@ -108,6 +109,14 @@ class AuthError(Exception):
     pass
 
 
+class MfaUnavailableError(AuthError):
+    """MFA code cannot be obtained (send limit exceeded / email never arrived).
+
+    Not worth retrying: every attempt requests another code and only eats
+    further into Medicover's code-send limit.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Medicover session
 # ---------------------------------------------------------------------------
@@ -123,6 +132,7 @@ class MedicoverSession:
         self.password = password
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
+        self.device_id: "str | None" = os.environ.get("MEDICOVER_DEVICE_ID") or None
 
     # ------------------------------------------------------------------
     # Session persistence
@@ -132,6 +142,8 @@ class MedicoverSession:
         """Save session cookies + refresh_token to disk for reuse between runs."""
         cookies = {c.name: c.value for c in self.session.cookies}
         data = {"cookies": cookies, "saved_at": time.time()}
+        if self.device_id:
+            data["device_id"] = self.device_id
         if getattr(self, "_refresh_token", None):
             data["refresh_token"] = self._refresh_token
         with open(SESSION_FILE, "w", encoding="utf-8") as f:
@@ -146,6 +158,8 @@ class MedicoverSession:
         try:
             with open(SESSION_FILE, encoding="utf-8") as f:
                 data = json.load(f)
+            # device_id is kept even when the session itself is too old
+            self.device_id = self.device_id or data.get("device_id")
             age_h = (time.time() - data.get("saved_at", 0)) / 3600
             if age_h > 24:
                 log.info("Zapisana sesja za stara (%.1fh) — pomijam.", age_h)
@@ -178,6 +192,28 @@ class MedicoverSession:
         except Exception as e:
             log.warning("Nie udało się zweryfikować sesji: %s", e)
         return False
+
+    def _ensure_device_id(self) -> str:
+        """Return a stable device_id, generating and persisting one if needed.
+
+        Medicover ties "trusted device" to device_id — a fresh random one per
+        login makes every login a new device and forces MFA each time.
+        """
+        if self.device_id:
+            return self.device_id
+        self.device_id = str(uuid.uuid4())
+        log.info("Wygenerowano nowy device_id: %s", self.device_id)
+        try:
+            data = {}
+            if os.path.exists(SESSION_FILE):
+                with open(SESSION_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+            data["device_id"] = self.device_id
+            with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception as e:
+            log.warning("Nie udało się zapisać device_id: %s", e)
+        return self.device_id
 
     # ------------------------------------------------------------------
     # PKCE helpers
@@ -344,7 +380,7 @@ class MedicoverSession:
         code_verifier = "".join(uuid.uuid4().hex for _ in range(3))
         code_challenge = self._pkce_challenge(code_verifier)
         state = "".join(random.choices(string.ascii_lowercase + string.digits, k=32))
-        device_id = str(uuid.uuid4())
+        device_id = self._ensure_device_id()
         epoch_ms = int(time.time()) * 1000
         oidc_redirect = f"{BASE_URL}/signin-oidc"
 
@@ -452,6 +488,18 @@ class MedicoverSession:
             resp = self.session.get(mfa_url, allow_redirects=False, timeout=30)
             soup = BeautifulSoup(resp.content, "html.parser")
 
+            # Server-rendered errors, e.g. code-send limit — no email will come
+            page_err = soup.find(attrs={"data-error-code": True})
+            if page_err:
+                err_code = page_err["data-error-code"]
+                err_text = page_err.get_text(strip=True)
+                if err_code == "AUTH_CODE_GENERATION_PERIOD_LIMIT_EXCEEDED":
+                    raise MfaUnavailableError(
+                        f"Medicover: przekroczony limit wysyłki kodów MFA ({err_text}). "
+                        "Kod nie zostanie wysłany — spróbuj później."
+                    )
+                log.warning("[Auth 3.5/5] Błąd na stronie MFA (%s): %s", err_code, err_text)
+
             # Check if this is a code-entry page (OTP via email)
             has_mfa_code = soup.find("input", {"name": "Input.MfaCode"})
 
@@ -488,7 +536,10 @@ class MedicoverSession:
                 log.info("[Auth 3.5/5] MFA wymaga kodu — pobieram z IMAP …")
                 otp = self._fetch_mfa_code_from_imap(known_exists=_pre_exists)
                 if not otp:
-                    raise AuthError("Nie udało się pobrać kodu MFA z emaila w ciągu 120s.")
+                    raise MfaUnavailableError(
+                        "Nie udało się pobrać kodu MFA z emaila w ciągu 120s "
+                        "(najpewniej limit wysyłki kodów)."
+                    )
 
                 log.info("[Auth 3.5/5] Kod MFA: %s — wysyłam …", otp)
 
@@ -529,7 +580,7 @@ class MedicoverSession:
                     # Search broadly for any error/validation messages
                     for sel in ["span.text-danger", "div.validation-summary-errors",
                                 ".field-validation-error", "[data-valmsg-summary]",
-                                ".alert-danger", ".error-message"]:
+                                ".alert-danger", ".error-message", "[data-error-code]"]:
                         err_el = err_soup.select_one(sel)
                         if err_el and err_el.get_text(strip=True):
                             log.error("[Auth 3.5/5] MFA error (%s): %s", sel, err_el.get_text(strip=True))
@@ -1172,6 +1223,27 @@ def _git_push_state() -> None:
 # Main monitoring logic
 # ---------------------------------------------------------------------------
 
+def _log_in_with_retry(sess: MedicoverSession, attempts: int = 3) -> None:
+    """Log in and save the session, retrying transient failures.
+
+    MfaUnavailableError is raised immediately — retrying would only request
+    more MFA codes on top of an exceeded send limit.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            sess.log_in()
+            sess.save_session()
+            return
+        except MfaUnavailableError as e:
+            log.error("Logowanie nieudane (bez ponawiania): %s", e)
+            raise
+        except (AuthError, requests.RequestException) as e:
+            log.error("Logowanie nieudane (próba %d/%d): %s", attempt, attempts, e)
+            if attempt == attempts:
+                raise
+            time.sleep(15)
+
+
 def run_monitor(args):
     """Check for appointments and send email if any are found."""
     username = _require_env("MEDICOVER_USER")
@@ -1202,22 +1274,13 @@ def run_monitor(args):
 
     sess = MedicoverSession(username, password)
     if not sess.load_session():
-        login_attempts = 3
-        for attempt in range(1, login_attempts + 1):
-            try:
-                sess.log_in()
-                break
-            except AuthError as e:
-                log.error("Logowanie nieudane (próba %d/%d): %s", attempt, login_attempts, e)
-                if attempt == login_attempts:
-                    raise
-                time.sleep(15)
-        sess.save_session()
+        _log_in_with_retry(sess)
 
     loop_interval = int(os.environ.get("MONITOR_INTERVAL_S", "300"))  # 5 min
     loop_duration = int(os.environ.get("MONITOR_DURATION_S", "0"))    # 0 = single run
     run_until = time.time() + loop_duration if loop_duration > 0 else 0
     loop_i = 0
+    exit_code = 0
 
     while True:
         loop_i += 1
@@ -1241,10 +1304,10 @@ def run_monitor(args):
                 else:
                     log.info("Sesja wygasła, refresh_token nie działa — ponawiam logowanie…")
                     try:
-                        sess.log_in()
-                        sess.save_session()
+                        _log_in_with_retry(sess)
                     except Exception as e:
                         log.error("Re-login nieudany (%s) — kończę pętlę.", e)
+                        exit_code = 1  # fail the run so it doesn't show as green
                         break
 
         log.info("=== Sprawdzanie terminów [iteracja %d] ===", loop_i)
@@ -1326,6 +1389,8 @@ def run_monitor(args):
             break
 
     log.info("Monitor zakończony po %d iteracjach.", loop_i)
+    if exit_code:
+        sys.exit(exit_code)
 
 
 # ---------------------------------------------------------------------------
